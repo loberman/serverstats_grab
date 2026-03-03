@@ -141,12 +141,20 @@ pub fn analyze(file_path: &str) -> std::io::Result<()> {
             let ts = cols.next().unwrap().parse::<u64>().unwrap_or(0);
             // Get ALL remaining numeric fields, so we can reliably pick running/blocked from the end
             let values: Vec<u64> = cols.filter_map(|v| v.parse::<u64>().ok()).collect();
-            // Defensive: expect at least 12 values (in your format there are 8 cpu fields + 2 zeros + running + blocked)
-            if values.len() >= 10 {
-                let vals = values.clone();   // Keep ALL CPU counters
-                let running = values.get(values.len() - 2).copied();
-                let blocked = values.get(values.len() - 1).copied();
-                cpu_vec.push((ts, vals, running, blocked));
+
+            // V4 CPU layout:
+            // [0..7] = user..steal
+            // [8]    = guest
+            // [9]    = running
+            // [10]   = blocked
+            // [11]   = intr
+            // [12]   = ctxt
+            // [13]   = processes
+
+            if values.len() >= 11 {
+                let running = values.get(9).copied();
+                let blocked = values.get(10).copied();
+                cpu_vec.push((ts, values.clone(), running, blocked));
             }
         }
         else if typ == "MEM" {

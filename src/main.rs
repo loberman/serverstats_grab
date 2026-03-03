@@ -34,13 +34,29 @@
  *  - Handles sparse data, missing metrics, and idle periods gracefully.
  *  - Output directory is self-contained—just copy and open `index.html` in any browser.
  *
- * USAGE:
- *    serverstats_grab -g <interval_seconds>       # Gather mode (writes .dat capture)
- *    serverstats_grab -pD <capturefile>           # Playback DISK metrics
- *    serverstats_grab -pC <capturefile>           # Playback CPU metrics
- *    serverstats_grab -pM <capturefile>           # Playback MEM metrics
- *    serverstats_grab -a <capturefile>            # Analysis mode (graphs + dashboard)
- *
+ * Usage:
+    serverstats_grab -g <interval_seconds>                            # Gather mode (all metrics)
+    serverstats_grab -g <interval_seconds> -o <output path>           # Gather mode (all metrics)
+    serverstats_grab -pD <capturefile>                                # Playback DISK
+    serverstats_grab -pD --from HH:MM:SS --to HH:MM:SS <capturefile>  # Playback DISK time window
+    serverstats_grab -pC <capturefile>                                # Playback CPU
+    serverstats_grab -pperCpu <capturefile>                           # Per CPU metrics
+    serverstats_grab -ptperCpu <capturefile>                          # Per CPU metrics grouped by time (collectl like)
+    serverstats_grab -pperCpu --cpu 3 <capturefile>                   # filter for CPU 3
+    serverstats_grab -pperCpu --top 10 <capturefile>                  # top 10 busy CPUS
+    serverstats_grab -pM <capturefile>                                # Playback MEM
+    serverstats_grab -pN <capturefile>                                # Playback NET
+    serverstats_grab -a <capturefile>                                 # Analysis mode (graphs + dashboard)
+    serverstats_grab -pMpath <multipath-ll.txt> <capturefile.dat>     # Multipath IO/KB/sec summary
+
+
+    After running the -a analyze option you can cd to the directory
+    Then run this python lightweight web server and browse the analysis data:
+    python3 -m http.server 8080
+
+    Please note! playback | more or less will see a thread main stack panic on quit
+    This can be safely ignored, it is how stdout works with Rust.
+
  * AUTHOR:
  *    Laurence Oberman <loberman@redhat.com>
  *    With code, ideas, and documentation support from ChatGPT (OpenAI)
@@ -50,7 +66,7 @@ mod analyze;
 mod mpath;
 
 // Increment as tool evolves
-const VERSION_NUMBER: &str = "3.0.0";
+const VERSION_NUMBER: &str = "4.0.0";
 
 use std::{
     fs::{File, OpenOptions},
@@ -224,6 +240,10 @@ the nice field.
             let mut procs_running: Option<u64> = None;
             let mut procs_blocked: Option<u64> = None;
             let mut cpu_vals: Vec<&str> = Vec::new();
+            let mut intr_total: Option<u64> = None;
+            let mut ctxt_total: Option<u64> = None;
+            let mut processes_total: Option<u64> = None;
+
             for line in buf.lines() {
                 if line.starts_with("cpu ") {
                     cpu_vals = line.split_whitespace().collect();
@@ -232,15 +252,61 @@ the nice field.
                 } else if line.starts_with("procs_blocked") {
                     procs_blocked = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
                 }
+                else if line.starts_with("intr ") {
+                intr_total = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+                 } else if line.starts_with("ctxt ") {
+                     ctxt_total = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+                 } else if line.starts_with("processes ") {
+                     processes_total = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+                }
             }
             if cpu_vals.len() >= 10 {
-                writeln!(out, "CPU,{},{},{},{},{},{},{},{},{},{},{},{}",
+                writeln!(out, "CPU,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                     now,
                     cpu_vals[1], cpu_vals[2], cpu_vals[3], cpu_vals[4], cpu_vals[5],
                     cpu_vals[6], cpu_vals[7], cpu_vals[8], cpu_vals[9],
-                    procs_running.unwrap_or(0), procs_blocked.unwrap_or(0)
+                    procs_running.unwrap_or(0), procs_blocked.unwrap_or(0),
+                    intr_total.unwrap_or(0),
+                    ctxt_total.unwrap_or(0),
+                    processes_total.unwrap_or(0)
                 )?;
             }
+
+            // --- Per CPU gather (SAFE V4.1 extension) ---
+        if let Ok(mut stat_file) = File::open("/proc/stat") {
+            let mut buf = String::new();
+            stat_file.read_to_string(&mut buf)?;
+
+            for line in buf.lines() {
+
+                // skip system aggregate "cpu "
+                if line.starts_with("cpu") && !line.starts_with("cpu ") {
+
+                    let cpu_vals: Vec<&str> = line.split_whitespace().collect();
+
+                    if cpu_vals.len() >= 10 {
+
+                        let cpu_id = cpu_vals[0].trim_start_matches("cpu");
+
+                        writeln!(out,
+                            "PCPU,{},{},{},{},{},{},{},{},{},{},{}",
+                            now,
+                            cpu_id,
+                            cpu_vals[1], // user
+                            cpu_vals[2], // nice
+                            cpu_vals[3], // system
+                            cpu_vals[4], // idle
+                            cpu_vals[5], // iowait
+                            cpu_vals[6], // irq
+                            cpu_vals[7], // softirq
+                            cpu_vals[8], // steal
+                            cpu_vals[9]  // guest
+                        )?;
+                    }
+                }
+            }
+        }
+
         }
 
         // --- MEM ---
@@ -421,145 +487,450 @@ fn playback_disk(file_path: &str, from_sec: Option<u32>, to_sec: Option<u32>) ->
     Ok(())
 }
 
-/* 
-Field   Name    Description
-1       user    Time spent on normal processes executing in user mode.
-2       nice    Time spent on low-priority (niced) processes executing in user mode.
-3       system  Time spent on processes executing in kernel mode (system calls, etc.).
-4       idle    Time spent in the idle task (CPU has nothing to do).
-5       iowait  Time spent waiting for I/O to complete.
-6       irq     Time spent servicing hardware interrupts.
-7       softirq Time spent servicing software interrupts (e.g., network processing).
-8       steal   Stolen time. Time spent on other guests by the hypervisor (only relevant in virtualized environments like Xen/KVM).
-9       guest   Time spent running a virtual CPU for a guest OS (non-niced). Note: This time is already included in the user field.
-10      guest_nice      Time spent running a niced virtual CPU for a guest OS (low-priority). Note: This time is already included in 
-the nice field.
- */
+/*
+V4 CPU Capture Format:
+
+CPU,ts,
+user,nice,system,idle,iowait,irq,softirq,steal,guest,
+running,
+blocked,
+intr,
+ctxt,
+processes
+
+Notes:
+- guest time is already included in user (kernel accounting)
+- guest_nice already included in nice
+- intr/ctxt/processes are cumulative since boot and must be delta’d per interval
+*/
 
 fn playback_cpu(file_path: &str) -> std::io::Result<()> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
-    let mut prev: Option<(u64, Vec<u64>, u64)> = None; // Updated to store guest value as well
+
+    // prev = ts, cpu_vals[0..8], guest, intr, ctxt, processes
+    let mut prev: Option<(u64, Vec<u64>, u64, u64, u64, u64)> = None;
     let mut printed_header = false;
 
     for line in reader.lines().flatten() {
         if line.starts_with("#TYPE") || line.starts_with('#') { continue; }
+
         let fields: Vec<&str> = line.split(',').collect();
         if fields.get(0) != Some(&"CPU") { continue; }
-        // We now expect 13 fields (CPU, ts, 9 CPU fields, running, blocked)
-        if fields.len() < 13 { continue; }
+
+        // V4 requires 16 fields
+        if fields.len() < 16 { continue; }
 
         let ts = fields[1].parse::<u64>().unwrap_or(0);
 
-        // 1. Grab the original 8 CPU fields (user to steal) at indices 2 through 9.
-        // This keeps vals.len() at 8, preserving old indices for user/nice/sys/idle/iowait.
-        let vals: Vec<u64> = fields[2..10].iter().filter_map(|v| v.parse::<u64>().ok()).collect();
+        // user..steal
+        let vals: Vec<u64> =
+            fields[2..10].iter().filter_map(|v| v.parse::<u64>().ok()).collect();
 
-        // 2. Explicitly grab the Guest CPU time, which is at index 10 in the raw log line.
-        let current_guest = fields[10].parse::<u64>().ok().unwrap_or(0);
+        if vals.len() < 8 { continue; }
 
-        // Running and Blocked are now always the last two, at indices 11 and 12
-        let running = fields[11].parse::<u64>().ok();
-        let blocked = fields[12].parse::<u64>().ok();
+        let current_guest = fields[10].parse::<u64>().unwrap_or(0);
+        let running       = fields[11].parse::<u64>().unwrap_or(0);
+        let blocked       = fields[12].parse::<u64>().unwrap_or(0);
+        let intr          = fields[13].parse::<u64>().unwrap_or(0);
+        let ctxt          = fields[14].parse::<u64>().unwrap_or(0);
+        let processes     = fields[15].parse::<u64>().unwrap_or(0);
 
-        // Check for 8 CPU time fields (user to steal)
-        if vals.len() >= 8 {
-            // Updated prev to check for (last_ts, last_vals, last_guest)
-            if let Some((last_ts, last_vals, last_guest)) = &prev {
-                let dt = ts.saturating_sub(*last_ts);
-                if dt == 0 { prev = Some((ts, vals, current_guest)); continue; }
+        if let Some((last_ts, last_vals, last_guest, last_intr, last_ctxt, last_proc)) = &prev {
 
-                // Calculate total time including the new guest value
-                // total_vals_diff = (user + nice + sys + idle + iowait + irq + softirq + steal) + guest_diff
-                let total_vals_diff: u64 = vals.iter().zip(last_vals.iter()).map(|(v, lv)| v - lv).sum();
-                let total = (total_vals_diff + (current_guest - last_guest)) as f64;
-
-                if total == 0.0 { prev = Some((ts, vals, current_guest)); continue; }
-
-                let total_inverse = 100.0 / total;
-
-                // These indices are now safely preserved because vals only holds the first 8 fields (user to steal)
-                let user   = (vals[0] - last_vals[0]) as f64 * total_inverse;
-                let nice   = (vals[1] - last_vals[1]) as f64 * total_inverse;
-                let sys    = (vals[2] - last_vals[2]) as f64 * total_inverse;
-                let idle   = (vals[3] - last_vals[3]) as f64 * total_inverse;
-                let iowait = (vals[4] - last_vals[4]) as f64 * total_inverse;
-
-                // Calculate guest percentage separately
-                let guest  = (current_guest.saturating_sub(*last_guest)) as f64 * total_inverse;
-
-                if !printed_header {
-                    println!(
-                        "{:<8} {:<10} {:<5} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>10}",
-                        "Time", "Epoch", "Δt", "User(%)", "System(%)", "Idle(%)", "IOWait(%)", "Nice(%)",
-                        "Running", "Blocked", "Guest"
-                    );
-                    printed_header = true;
-                }
-
-                let dt_obj = chrono::Local.timestamp_opt(ts as i64, 0).single().unwrap();
-                let t_hms = dt_obj.format("%H:%M:%S").to_string();
-
-                println!(
-                    "{:<8} {:<10} {:<5} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>8} {:>8} {:>10.2}",
-                    t_hms, ts, dt, user, sys, idle, iowait, nice,
-                    running.unwrap_or(0), blocked.unwrap_or(0), guest
-                );
+            let dt = ts.saturating_sub(*last_ts);
+            if dt == 0 {
+                prev = Some((ts, vals, current_guest, intr, ctxt, processes));
+                continue;
             }
-            // Update prev with the new state, including the current guest value
-            prev = Some((ts, vals, current_guest));
+
+            // V3-correct total (guest included)
+            let total_vals_diff: u64 =
+                vals.iter().zip(last_vals.iter()).map(|(v, lv)| v - lv).sum();
+
+            let total = (total_vals_diff +
+                current_guest.saturating_sub(*last_guest)) as f64;
+
+            if total == 0.0 {
+                prev = Some((ts, vals, current_guest, intr, ctxt, processes));
+                continue;
+            }
+
+            let inv = 100.0 / total;
+
+            let user   = (vals[0] - last_vals[0]) as f64 * inv;
+            let nice   = (vals[1] - last_vals[1]) as f64 * inv;
+            let sys    = (vals[2] - last_vals[2]) as f64 * inv;
+            let iowait = (vals[4] - last_vals[4]) as f64 * inv;
+            let irq    = (vals[5] - last_vals[5]) as f64 * inv;
+            let soft   = (vals[6] - last_vals[6]) as f64 * inv;
+            let steal  = (vals[7] - last_vals[7]) as f64 * inv;
+            let guest  = (current_guest.saturating_sub(*last_guest)) as f64 * inv;
+
+            let idle = 100.0 -
+                (user + nice + sys + iowait +
+                 irq + soft + steal + guest);
+
+            // NEW V4 RATES
+            let intr_s = intr.saturating_sub(*last_intr) as f64 / dt as f64;
+            let ctxt_s = ctxt.saturating_sub(*last_ctxt) as f64 / dt as f64;
+            let proc_s = processes.saturating_sub(*last_proc) as f64 / dt as f64;
+
+            if !printed_header {
+                println!(
+"{:<8} {:<10} {:<5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>6} {:>6}",
+"Time","Epoch","Δt",
+"User%","Nice%","Sys%","Wait%","IRQ%","Soft%","Steal%","Guest%","Idle%",
+"Intr/s","Ctx/s","Proc/s","Run","Blk"
+                );
+                printed_header = true;
+            }
+
+            let dt_obj =
+                chrono::Local.timestamp_opt(ts as i64, 0).single().unwrap();
+            let t_hms = dt_obj.format("%H:%M:%S").to_string();
+
+            println!(
+"{:<8} {:<10} {:<5} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>10.2} {:>10.2} {:>10.2} {:>6} {:>6}",
+t_hms, ts, dt,
+user, nice, sys, iowait,
+irq, soft, steal, guest, idle,
+intr_s, ctxt_s, proc_s,
+running, blocked
+            );
         }
+
+        prev = Some((ts, vals, current_guest, intr, ctxt, processes));
     }
+
     if !printed_header {
         println!("No CPU data found.");
+    }
+
+    Ok(())
+}
+
+fn playback_percpu(
+    file_path: &str,
+    cpu_filter: Option<u32>,
+    top_n: Option<usize>
+) -> std::io::Result<()> {
+
+    use std::collections::HashMap;
+    use chrono::TimeZone;
+
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+
+    // cpu_id -> Vec<(ts, vals)>
+    let mut per_cpu: HashMap<u32, Vec<(u64, Vec<u64>)>> = HashMap::new();
+
+    for line in reader.lines().flatten() {
+        if line.starts_with('#') { continue; }
+
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.get(0) != Some(&"PCPU") { continue; }
+        if fields.len() < 12 { continue; }
+
+        let ts = fields[1].parse::<u64>().unwrap_or(0);
+        let cpu_id = fields[2].parse::<u32>().unwrap_or(0);
+
+        let vals: Vec<u64> = fields[3..12]
+            .iter()
+            .filter_map(|v| v.parse::<u64>().ok())
+            .collect();
+
+        if vals.len() < 9 { continue; }
+
+        per_cpu.entry(cpu_id).or_default().push((ts, vals));
+    }
+
+    // --- TOP MODE ---
+    if let Some(top) = top_n {
+
+        let mut avg_busy: Vec<(u32, f64)> = Vec::new();
+
+        for (cpu, samples) in &per_cpu {
+            if samples.len() < 2 { continue; }
+
+            let mut busy_sum = 0.0;
+            let mut count = 0;
+
+            for w in samples.windows(2) {
+                let (_, last) = &w[0];
+                let (_, curr) = &w[1];
+
+                let total: u64 = curr.iter().zip(last.iter())
+                    .map(|(c,l)| c.saturating_sub(*l))
+                    .sum();
+
+                if total == 0 { continue; }
+
+                let busy =
+                    curr[0].saturating_sub(last[0]) +
+                    curr[1].saturating_sub(last[1]) +
+                    curr[2].saturating_sub(last[2]) +
+                    curr[4].saturating_sub(last[4]) +
+                    curr[5].saturating_sub(last[5]) +
+                    curr[6].saturating_sub(last[6]) +
+                    curr[7].saturating_sub(last[7]) +
+                    curr[8].saturating_sub(last[8]);
+
+                busy_sum += (busy as f64 / total as f64) * 100.0;
+                count += 1;
+            }
+
+            if count > 0 {
+                avg_busy.push((*cpu, busy_sum / count as f64));
+            }
+        }
+
+        avg_busy.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+
+        println!("Top {} CPUs by Avg Busy:", top);
+        for (cpu, val) in avg_busy.iter().take(top) {
+            println!("CPU{:>3}  {:>6.2}%", cpu, val);
+        }
+        return Ok(());
+    }
+
+    // --- NORMAL MODE ---
+    println!(
+        "{:<8} {:<10} {:<4} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "Time","Epoch","CPU","User%","Sys%","Idle%","Wait%","IRQ%","Soft%","Steal%","Guest%"
+    );
+
+    for (cpu, samples) in per_cpu {
+
+        if let Some(filter) = cpu_filter {
+            if cpu != filter { continue; }
+        }
+
+        if samples.len() < 2 { continue; }
+
+        for w in samples.windows(2) {
+
+            let (last_ts, last_vals) = &w[0];
+            let (ts, vals) = &w[1];
+
+            let dt = ts.saturating_sub(*last_ts);
+            if dt == 0 { continue; }
+
+            let total: u64 = vals.iter().zip(last_vals.iter())
+                .map(|(c,l)| c.saturating_sub(*l))
+                .sum();
+
+            if total == 0 { continue; }
+
+            let inv = 100.0 / total as f64;
+
+            let user   = (vals[0]-last_vals[0]) as f64 * inv;
+            let sys    = (vals[2]-last_vals[2]) as f64 * inv;
+            let idle   = (vals[3]-last_vals[3]) as f64 * inv;
+            let wait   = (vals[4]-last_vals[4]) as f64 * inv;
+            let irq    = (vals[5]-last_vals[5]) as f64 * inv;
+            let soft   = (vals[6]-last_vals[6]) as f64 * inv;
+            let steal  = (vals[7]-last_vals[7]) as f64 * inv;
+            let guest  = (vals[8]-last_vals[8]) as f64 * inv;
+
+            let dt_obj = chrono::Local.timestamp_opt(*ts as i64,0).single().unwrap();
+            let t = dt_obj.format("%H:%M:%S");
+
+            println!(
+                "{:<8} {:<10} {:<4} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2}",
+                t, ts, cpu, user, sys, idle, wait, irq, soft, steal, guest
+            );
+        }
     }
     Ok(())
 }
 
+fn playback_percpu_by_time(
+    file_path: &str,
+    cpu_filter: Option<u32>
+) -> std::io::Result<()> {
+
+    use std::collections::{BTreeMap, HashMap};
+    use chrono::{Local, TimeZone};
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+
+    // ts -> cpu -> vals
+    let mut by_time: BTreeMap<u64, HashMap<u32, Vec<u64>>> = BTreeMap::new();
+
+    for line in reader.lines().flatten() {
+        if line.starts_with('#') { continue; }
+
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.get(0) != Some(&"PCPU") { continue; }
+        if fields.len() < 12 { continue; }
+
+        let ts = fields[1].parse::<u64>().unwrap_or(0);
+        let cpu_id = fields[2].parse::<u32>().unwrap_or(0);
+
+        if let Some(filter) = cpu_filter {
+            if cpu_id != filter { continue; }
+        }
+
+        let vals: Vec<u64> = fields[3..12]
+            .iter()
+            .filter_map(|v| v.parse::<u64>().ok())
+            .collect();
+
+        if vals.len() < 9 { continue; }
+
+        by_time
+            .entry(ts)
+            .or_default()
+            .insert(cpu_id, vals);
+    }
+
+    println!(
+"{:<8} {:>10} {:>4} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+"Time","Epoch","CPU","User%","Sys%","Idle%","Wait%","IRQ%","Soft%","Steal%","Guest%"
+    );
+
+    let mut prev: HashMap<u32, Vec<u64>> = HashMap::new();
+
+    for (ts, cpu_map) in &by_time {
+
+        // --- SORT CPU IDs ---
+        let mut cpu_keys: Vec<u32> = cpu_map.keys().cloned().collect();
+        cpu_keys.sort_unstable();
+
+        for cpu in cpu_keys {
+
+            let curr = cpu_map.get(&cpu).unwrap();
+
+            if let Some(last) = prev.get(&cpu) {
+
+                let total: u64 = curr.iter().zip(last.iter())
+                    .map(|(c,l)| c.saturating_sub(*l))
+                    .sum();
+
+                if total == 0 { continue; }
+
+                let delta = |i: usize| curr[i].saturating_sub(last[i]) as f64;
+                let pct   = |i: usize| (delta(i) / total as f64) * 100.0;
+
+                let time_str = Local.timestamp_opt(*ts as i64,0)
+                    .unwrap()
+                    .format("%H:%M:%S")
+                    .to_string();
+
+                println!(
+"{:<8} {:>10} {:>4} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2}",
+time_str, ts, cpu,
+pct(0), pct(1), pct(3), pct(2),
+pct(5), pct(6), pct(7), pct(8)
+                );
+            }
+
+            prev.insert(cpu, curr.clone());
+        }
+    }
+
+    Ok(())
+}
+
 /// Playback memory stats from a previously captured file.
+/// Enhanced V4-style output (percent + human-friendly GiB/MB columns)
 fn playback_mem(file_path: &str) -> std::io::Result<()> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
     let mut printed_header = false;
 
+    // Convert helpers
+    let kb_to_gib = |kb: f64| kb / 1024.0 / 1024.0;
+    let kb_to_mb  = |kb: f64| kb / 1024.0;
+
     for line in reader.lines().flatten() {
         if line.starts_with("#TYPE") || line.starts_with('#') { continue; }
+
         let mut cols = line.split(',');
         let typ = cols.next().unwrap_or("");
         if typ != "MEM" { continue; }
+
         let ts = cols.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+
+        // These match your gather() MEM writeln ordering
         let keys = [
             "MemTotal","MemFree","MemAvailable","Buffers","Cached",
-            "SwapTotal","SwapFree","Dirty","Writeback","Active(file)","Inactive(file)","Slab","KReclaimable","SReclaimable"
+            "SwapTotal","SwapFree","Dirty","Writeback",
+            "Active(file)","Inactive(file)","Slab","KReclaimable","SReclaimable"
         ];
-        let mut vals = HashMap::new();
+
+        let mut vals: HashMap<String, u64> = HashMap::new();
         for (k, v) in keys.iter().zip(cols) {
             vals.insert((*k).to_string(), v.parse::<u64>().unwrap_or(0));
         }
-        let mem_total = *vals.get("MemTotal").unwrap_or(&1) as f64;
-        let mem_free  = *vals.get("MemFree").unwrap_or(&0) as f64;
-        let mem_avail = *vals.get("MemAvailable").unwrap_or(&0) as f64;
-        let cached    = *vals.get("Cached").unwrap_or(&0) as f64;
-        let used = mem_total - mem_free;
-        let used_percent = if mem_total > 0.0 { used / mem_total * 100.0 } else { 0.0 };
-        let avail_percent = if mem_total > 0.0 { mem_avail / mem_total * 100.0 } else { 0.0 };
-        let cached_percent = if mem_total > 0.0 { cached / mem_total * 100.0 } else { 0.0 };
-        let free_percent = if mem_total > 0.0 { mem_free / mem_total * 100.0 } else { 0.0 };
+
+        // Raw kB
+        let mem_total_kb = *vals.get("MemTotal").unwrap_or(&0) as f64;
+        let mem_free_kb  = *vals.get("MemFree").unwrap_or(&0) as f64;
+        let mem_avail_kb = *vals.get("MemAvailable").unwrap_or(&0) as f64;
+        let buff_kb      = *vals.get("Buffers").unwrap_or(&0) as f64;
+        let cache_kb     = *vals.get("Cached").unwrap_or(&0) as f64;
+        let slab_kb      = *vals.get("Slab").unwrap_or(&0) as f64;
+        let inact_kb     = *vals.get("Inactive(file)").unwrap_or(&0) as f64;
+        let krecl_kb     = *vals.get("KReclaimable").unwrap_or(&0) as f64;
+
+        let swap_total_kb = *vals.get("SwapTotal").unwrap_or(&0) as f64;
+        let swap_free_kb  = *vals.get("SwapFree").unwrap_or(&0) as f64;
+        let dirty_kb      = *vals.get("Dirty").unwrap_or(&0) as f64;
+        let wback_kb      = *vals.get("Writeback").unwrap_or(&0) as f64;
+
+        // Percents
+        let used_kb = (mem_total_kb - mem_free_kb).max(0.0);
+
+        let used_percent   = if mem_total_kb > 0.0 { used_kb     / mem_total_kb * 100.0 } else { 0.0 };
+        let avail_percent  = if mem_total_kb > 0.0 { mem_avail_kb/ mem_total_kb * 100.0 } else { 0.0 };
+        let cached_percent = if mem_total_kb > 0.0 { cache_kb    / mem_total_kb * 100.0 } else { 0.0 };
+        let free_percent   = if mem_total_kb > 0.0 { mem_free_kb / mem_total_kb * 100.0 } else { 0.0 };
+
+        // GiB columns
+        let mem_gib   = kb_to_gib(mem_total_kb);
+        let used_gib  = kb_to_gib(used_kb);
+        let avail_gib = kb_to_gib(mem_avail_kb);
+        let buff_gib  = kb_to_gib(buff_kb);
+        let cache_gib = kb_to_gib(cache_kb);
+        let slab_gib  = kb_to_gib(slab_kb);
+        let inact_gib = kb_to_gib(inact_kb);
+        let krecl_gib = kb_to_gib(krecl_kb);
+
+        let swap_gib  = kb_to_gib(swap_total_kb);
+        let swap_used = kb_to_gib((swap_total_kb - swap_free_kb).max(0.0));
+
+        // MB columns
+        let dirty_mb = kb_to_mb(dirty_kb);
+        let wb_mb    = kb_to_mb(wback_kb);
 
         if !printed_header {
             println!(
-                "{:<8} {:<10} {:>12} {:>12} {:>12} {:>12}",
-                "Time", "Epoch", "%Used", "%Avail", "%Cached", "%Free"
+                "{:<8} {:<10} {:>7} {:>7} {:>7} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8}",
+                "Time","Epoch","Used%","Avail%","Cached%","Free%","MemGiB","UsedGiB","AvailGiB","BuffGiB","CacheGiB",
+                "SlabGiB","InactGiB","KReclGiB","SwapGiB","SwapUsed","DirtyMB","WBackMB"
             );
             printed_header = true;
         }
+
         let dt_obj = Local.timestamp_opt(ts as i64, 0).single().unwrap();
         let t_hms = dt_obj.format("%H:%M:%S").to_string();
+
         println!(
-            "{:<8} {:<10} {:>12.2} {:>12.2} {:>12.2} {:>12.2}",
-            t_hms, ts, used_percent, avail_percent, cached_percent, free_percent
+            "{:<8} {:<10} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>8.2} {:>8.2}",
+            t_hms, ts,
+            used_percent, avail_percent, cached_percent, free_percent,
+            mem_gib, used_gib, avail_gib, buff_gib, cache_gib,
+            slab_gib, inact_gib, krecl_gib,
+            swap_gib, swap_used,
+            dirty_mb, wb_mb
         );
     }
+
     if !printed_header {
         println!("No MEM data found.");
     }
@@ -637,6 +1008,10 @@ fn usage() {
     serverstats_grab -pD <capturefile>                                # Playback DISK
     serverstats_grab -pD --from HH:MM:SS --to HH:MM:SS <capturefile>  # Playback DISK time window
     serverstats_grab -pC <capturefile>                                # Playback CPU
+    serverstats_grab -pperCpu <capturefile>                           # Per CPU metrics
+    serverstats_grab -ptperCpu <capturefile>                          # Per CPU metrics grouped by time (collectl like)
+    serverstats_grab -pperCpu --cpu 3 <capturefile>                   # filter for CPU 3
+    serverstats_grab -pperCpu --top 10 <capturefile>                  # top 10 busy CPUS
     serverstats_grab -pM <capturefile>                                # Playback MEM
     serverstats_grab -pN <capturefile>                                # Playback NET
     serverstats_grab -a <capturefile>                                 # Analysis mode (graphs + dashboard)
@@ -745,6 +1120,41 @@ fn main() -> std::io::Result<()> {
             let fname = args.get(2).map(|s| s.as_str()).unwrap_or("serverstats_grab.dat");
             playback_cpu(fname)
         }
+        "-pperCpu" => {
+
+    let mut cpu_filter: Option<u32> = None;
+    let mut top_n: Option<usize> = None;
+    let mut file_arg: Option<String> = None;
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cpu" if i+1 < args.len() => {
+                cpu_filter = args[i+1].parse().ok();
+                i += 2;
+            }
+            "--top" if i+1 < args.len() => {
+                top_n = args[i+1].parse().ok();
+                i += 2;
+            }
+            s => {
+                file_arg = Some(s.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    let fname = file_arg.as_deref().unwrap_or("serverstats_grab.dat");
+    playback_percpu(fname, cpu_filter, top_n)
+}
+        "-ptperCpu" => {
+            if args.len() < 3 {
+                eprintln!("Usage: {} -ptperCpu <file>", args[0]);
+                std::process::exit(1);
+            }
+            return playback_percpu_by_time(&args[2], None);
+        }
+
         "-pM" => {
             let fname = args.get(2).map(|s| s.as_str()).unwrap_or("serverstats_grab.dat");
             playback_mem(fname)
