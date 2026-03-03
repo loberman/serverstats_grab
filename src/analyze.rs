@@ -41,14 +41,14 @@ use chrono::TimeZone;
 
 /// Per-interval computed disk metrics for plotting/stats
 #[derive(Debug, Clone)]
-struct IntervalDiskMetrics {
+pub struct IntervalDiskMetrics {
     ts: u64,
-    rps: f64,       // Read IOPS/sec
-    wps: f64,       // Write IOPS/sec
-    io_sec: f64,    // Total IO/sec
-    rd_kbs: f64,    // Read KB/sec
-    wr_kbs: f64,    // Write KB/sec
-    kb_sec: f64,    // Total KB/sec
+    pub(crate) rps: f64,       // Read IOPS/sec
+    pub(crate) wps: f64,       // Write IOPS/sec
+    pub(crate) io_sec: f64,    // Total IO/sec
+    pub(crate) rd_kbs: f64,    // Read KB/sec
+    pub(crate) wr_kbs: f64,    // Write KB/sec
+    pub(crate) kb_sec: f64,    // Total KB/sec
     avg_queue_depth: f64, // <-- Rename this from qlen: for your interval-based calculation
     qlen: f64,      // <-- New: collectl/iostat-style (delta_weighted_io_time / delta_io_time)
     svctim: f64,    // calclated service time
@@ -1208,5 +1208,77 @@ where
     F: Fn(&IntervalDiskMetrics) -> f64,
 {
     data.iter().map(|x| f(x)).fold(0.0, |acc, v| acc.max(v))
+}
+
+
+/// Helper to load disk metrics (for use by multipath module)
+pub fn get_disk_metrics_map(file_path: &str) -> std::io::Result<std::collections::HashMap<String, Vec<IntervalDiskMetrics>>> {
+    // Essentially copy your parsing up to the per-device metrics map in analyze.rs
+    // (Same as in analyze())
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+    let mut per_device: HashMap<String, Vec<(u64, crate::DiskStat)>> = HashMap::new();
+
+    for line in reader.lines().flatten() {
+        if line.starts_with('#') { continue; }
+        let mut cols = line.split(',');
+        let typ = cols.next().unwrap_or("");
+        if typ == "DISK" {
+            let ts = cols.next().unwrap().parse::<u64>().unwrap_or(0);
+            let fields: Vec<&str> = cols.collect();
+            if let Some(stat) = crate::analyze::parse_disk_from_fields(&fields) {
+                per_device.entry(stat.name.clone()).or_default().push((ts, stat));
+            }
+        }
+    }
+    // Convert to per-device Vec<IntervalDiskMetrics>
+    let mut out: HashMap<String, Vec<IntervalDiskMetrics>> = HashMap::new();
+    for (dev, rows) in per_device {
+        let mut prev: Option<(u64, crate::DiskStat)> = None;
+        let mut metrics = Vec::new();
+        for (ts, stat) in rows {
+            if let Some((last_ts, last_stat)) = &prev {
+                let dt = ts.saturating_sub(*last_ts);
+                if dt == 0 { prev = Some((ts, stat.clone())); continue; }
+                let d_reads = stat.reads.saturating_sub(last_stat.reads);
+                let d_writes = stat.writes.saturating_sub(last_stat.writes);
+                let d_sectors_read = stat.sectors_read.saturating_sub(last_stat.sectors_read);
+                let d_sectors_written = stat.sectors_written.saturating_sub(last_stat.sectors_written);
+                let delta_weighted_io_time_ms = stat.weighted_io_time_ms.saturating_sub(last_stat.weighted_io_time_ms);
+                let avg_queue_depth = delta_weighted_io_time_ms as f64 / (dt as f64 * 1000.0);
+                let delta_io_time_ms = stat.io_time_ms.saturating_sub(last_stat.io_time_ms);
+                let qlen = if delta_io_time_ms > 0 {
+                    delta_weighted_io_time_ms as f64 / delta_io_time_ms as f64
+                } else { 0.0 };
+                let rps = d_reads as f64 / dt as f64;
+                let wps = d_writes as f64 / dt as f64;
+                let rd_kbs = d_sectors_read as f64 * 512.0 / 1024.0 / dt as f64;
+                let wr_kbs = d_sectors_written as f64 * 512.0 / 1024.0 / dt as f64;
+
+                metrics.push(IntervalDiskMetrics {
+                    ts,
+                    rps,
+                    wps,
+                    io_sec: rps + wps,
+                    rd_kbs,
+                    wr_kbs,
+                    kb_sec: rd_kbs + wr_kbs,
+                    avg_queue_depth,
+                    qlen,
+                    svctim: 0.0, // Not used in summary
+                    await_rd: 0.0, await_wr: 0.0, discards_s: 0.0, discards_merged_s: 0.0, sectors_discarded_s: 0.0, await_discard_ms: 0.0, discard_kbs: 0.0,
+                });
+            }
+            prev = Some((ts, stat));
+        }
+        if !metrics.is_empty() {
+            out.insert(dev, metrics);
+        }
+    }
+    Ok(out)
 }
 

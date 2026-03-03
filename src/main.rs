@@ -47,9 +47,10 @@
  */
 
 mod analyze;
+mod mpath;
 
 // Increment as tool evolves
-const VERSION_NUMBER: &str = "2.1.4";
+const VERSION_NUMBER: &str = "3.0.0";
 
 use std::{
     fs::{File, OpenOptions},
@@ -173,7 +174,7 @@ fn gather(interval: u64, out_path: &str) -> std::io::Result<()> {
         for line in reader.lines().flatten() {
             if let Some(stat) = DiskStat::from_line(&line) {
                 if stat.name.starts_with("sd") || stat.name.starts_with("nvme") || stat.name.starts_with("dm-") || stat.name.starts_with("loop")
-                    || stat.name.starts_with("emcpower") || stat.name.starts_with("vd") || stat.name.starts_with("rbd") || stat.name.starts_with("md")
+                    || stat.name.starts_with("emcpower") || stat.name.starts_with("vd") || stat.name.starts_with("rbd") || stat.name.starts_with("md") || stat.name.starts_with("scini")
                 {
                     writeln!(
                         out,
@@ -639,6 +640,7 @@ fn usage() {
     serverstats_grab -pM <capturefile>                                # Playback MEM
     serverstats_grab -pN <capturefile>                                # Playback NET
     serverstats_grab -a <capturefile>                                 # Analysis mode (graphs + dashboard)
+    serverstats_grab -pMpath <multipath-ll.txt> <capturefile.dat>     # Multipath IO/KB/sec summary
 
     After running the -a analyze option you can cd to the directory
     Then run this python lightweight web server and browse the analysis data:
@@ -756,6 +758,12 @@ fn main() -> std::io::Result<()> {
             let fname = args.get(2).map(|s| s.as_str()).unwrap_or("serverstats_grab.dat");
             analyze::analyze(fname)
         }
+            "-pMpath" => {
+        let mp_ll = args.get(2).expect("multipath-ll.txt required");
+        let dat = args.get(3).expect("capturefile.dat required");
+        mpath::report_mpath_stats(mp_ll, dat)
+        }
+
         _ => {
             usage();
             std::process::exit(1);
