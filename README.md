@@ -6,7 +6,6 @@ _By Laurence Oberman · GPL v3 · Rust · Graphs & HTML Dashboard_
 ---
 
 ## Overview
-Version 4.0.0
 
 **serverstats_grab** is a modern, open-source telemetry tool for Linux servers, capturing key I/O, CPU,NET and memory stats to a single capture file, with rich playback and browser-based analysis.
 

@@ -61,6 +61,13 @@ pub struct IntervalDiskMetrics {
     await_discard_ms: f64,   // New: Discard await time (ms)
 }
 
+fn sanitize_latency(v: f64) -> f64 {
+    if !v.is_finite() || v < 0.0 || v > 60000.0 {
+        0.0
+    } else {
+        v
+    }
+}
 /// Per-interval CPU utilization summary
 #[derive(Debug, Clone)]
 struct CpuMetrics {
@@ -200,86 +207,152 @@ else if typ == "NET" {
 
 
     // ========== Step 2: Process raw Vecs into per-interval metric Vecs ==========
+// --- Disk Metrics ---
+let mut disk_metrics: HashMap<String, Vec<IntervalDiskMetrics>> = HashMap::new();
 
-    // --- Disk Metrics ---
-    let mut disk_metrics: HashMap<String, Vec<IntervalDiskMetrics>> = HashMap::new();
-    for (dev, rows) in &per_device {
-        let mut prev: Option<(u64, &DiskStat)> = None;
-        let mut out = Vec::new();
-        for (ts, stat) in rows {
-            if let Some((last_ts, last_stat)) = prev {
-                let dt = (*ts).saturating_sub(last_ts);
-                if dt == 0 { prev = Some((*ts, stat)); continue; }
-                let d_reads = stat.reads.saturating_sub(last_stat.reads);
-                let d_writes = stat.writes.saturating_sub(last_stat.writes);
-                let d_sectors_read = stat.sectors_read.saturating_sub(last_stat.sectors_read);
-                let d_sectors_written = stat.sectors_written.saturating_sub(last_stat.sectors_written);
-                let delta_weighted_io_time_ms = stat.weighted_io_time_ms.saturating_sub(last_stat.weighted_io_time_ms);
-                let avg_queue_depth = delta_weighted_io_time_ms as f64 / (dt as f64 * 1000.0);
-                let delta_io_time_ms = stat.io_time_ms.saturating_sub(last_stat.io_time_ms);
-                let qlen = if delta_io_time_ms > 0 {
-                    delta_weighted_io_time_ms as f64 / delta_io_time_ms as f64
-                } else {
-                    0.0
-                };
-                let delta_io_time_ms = stat.io_time_ms.saturating_sub(last_stat.io_time_ms);
-                let total_ios = d_reads + d_writes;
-                let svctim = if total_ios > 0 {
-                    delta_io_time_ms as f64 / total_ios as f64
-                } else {
-                    0.0
-                };
-                let rps = d_reads as f64 / dt as f64;
-                let wps = d_writes as f64 / dt as f64;
-                let io_sec = rps + wps;
-                let rd_kbs = d_sectors_read as f64 * 512.0 / 1024.0 / dt as f64;
-                let wr_kbs = d_sectors_written as f64 * 512.0 / 1024.0 / dt as f64;
-                let kb_sec = rd_kbs + wr_kbs;
-                let await_read_ms = if d_reads > 0 {
-                    (stat.read_time_ms.saturating_sub(last_stat.read_time_ms)) as f64 / d_reads as f64
-                } else { 0.0 };
-                let await_write_ms = if d_writes > 0 {
-                    (stat.write_time_ms.saturating_sub(last_stat.write_time_ms)) as f64 / d_writes as f64
-                } else { 0.0 };
-                    let d_discards = stat.discards.saturating_sub(last_stat.discards);
-                    let d_discards_merged = stat.discards_merged.saturating_sub(last_stat.discards_merged);
-                    let d_sectors_discarded = stat.sectors_discarded.saturating_sub(last_stat.sectors_discarded);
-                    let d_discard_time_ms = stat.discard_time_ms.saturating_sub(last_stat.discard_time_ms);
-                    let sectors_discarded_s = d_sectors_discarded as f64 / dt as f64;
-                    let discards_s = d_discards as f64 / dt as f64;
-                    let discards_merged_s = d_discards_merged as f64 / dt as f64;
-                    // If you want KB/sec for discards, multiply by 0.5 (just like you do for reads/writes if 512B sectors)
-                    let discard_kbs = d_sectors_discarded as f64 * 0.5 / dt as f64;
-                    let await_discard_ms = if d_discards > 0 {
-                        d_discard_time_ms as f64 / d_discards as f64
-                    } else { 0.0 };
+for (dev, rows) in &per_device {
+    let mut prev: Option<(u64, &DiskStat)> = None;
+    let mut out = Vec::new();
 
-                    out.push(IntervalDiskMetrics {
-                        ts: *ts,
-                        rps,
-                        wps,
-                        io_sec,
-                        rd_kbs,
-                        wr_kbs,
-                        kb_sec,
-                        avg_queue_depth,
-                        qlen,
-                        svctim,
-                        await_rd: await_read_ms,
-                        await_wr: await_write_ms,
-                        discards_s,
-                        discards_merged_s,
-                        sectors_discarded_s,
-                        await_discard_ms,
-                        discard_kbs,
-                    });
+    for (ts, stat) in rows {
+        if let Some((last_ts, last_stat)) = prev {
+            let dt = (*ts).saturating_sub(last_ts);
+            if dt == 0 {
+                prev = Some((*ts, stat));
+                continue;
             }
-            prev = Some((*ts, stat));
+
+            // ================================
+            // HARD FILTER: enforce monotonicity
+            // ================================
+            if stat.reads < last_stat.reads
+                || stat.writes < last_stat.writes
+                || stat.read_time_ms < last_stat.read_time_ms
+                || stat.write_time_ms < last_stat.write_time_ms
+                || stat.weighted_io_time_ms < last_stat.weighted_io_time_ms
+                || stat.io_time_ms < last_stat.io_time_ms
+                || stat.sectors_read < last_stat.sectors_read
+                || stat.sectors_written < last_stat.sectors_written
+                || stat.discards < last_stat.discards
+                || stat.discard_time_ms < last_stat.discard_time_ms
+                || stat.sectors_discarded < last_stat.sectors_discarded
+            {
+                prev = Some((*ts, stat));
+                continue;
+            }
+
+            // ================================
+            // SAFE deltas (NO saturating_sub)
+            // ================================
+            let d_reads = stat.reads - last_stat.reads;
+            let d_writes = stat.writes - last_stat.writes;
+            let d_sectors_read = stat.sectors_read - last_stat.sectors_read;
+            let d_sectors_written = stat.sectors_written - last_stat.sectors_written;
+
+            let delta_weighted_io_time_ms =
+                stat.weighted_io_time_ms - last_stat.weighted_io_time_ms;
+
+            let avg_queue_depth =
+                delta_weighted_io_time_ms as f64 / (dt as f64 * 1000.0);
+
+            let delta_io_time_ms =
+                stat.io_time_ms - last_stat.io_time_ms;
+
+            let qlen = if delta_io_time_ms > 0 {
+                delta_weighted_io_time_ms as f64 / delta_io_time_ms as f64
+            } else {
+                0.0
+            };
+
+            let total_ios = d_reads + d_writes;
+            let svctim = if total_ios > 0 {
+                delta_io_time_ms as f64 / total_ios as f64
+            } else {
+                0.0
+            };
+
+            let rps = d_reads as f64 / dt as f64;
+            let wps = d_writes as f64 / dt as f64;
+            let io_sec = rps + wps;
+
+            let rd_kbs =
+                d_sectors_read as f64 * 512.0 / 1024.0 / dt as f64;
+            let wr_kbs =
+                d_sectors_written as f64 * 512.0 / 1024.0 / dt as f64;
+            let kb_sec = rd_kbs + wr_kbs;
+
+            let await_read_ms = sanitize_latency(
+                if d_reads > 0 {
+                    (stat.read_time_ms - last_stat.read_time_ms) as f64
+                        / d_reads as f64
+                } else {
+                    0.0
+                },
+            );
+
+            let await_write_ms = sanitize_latency(
+                if d_writes > 0 {
+                    (stat.write_time_ms - last_stat.write_time_ms) as f64
+                        / d_writes as f64
+                } else {
+                    0.0
+                },
+            );
+
+            // Discards
+            let d_discards = stat.discards - last_stat.discards;
+            let d_discards_merged =
+                stat.discards_merged - last_stat.discards_merged;
+            let d_sectors_discarded =
+                stat.sectors_discarded - last_stat.sectors_discarded;
+            let d_discard_time_ms =
+                stat.discard_time_ms - last_stat.discard_time_ms;
+
+            let sectors_discarded_s =
+                d_sectors_discarded as f64 / dt as f64;
+            let discards_s = d_discards as f64 / dt as f64;
+            let discards_merged_s =
+                d_discards_merged as f64 / dt as f64;
+
+            let discard_kbs =
+                d_sectors_discarded as f64 * 0.5 / dt as f64;
+
+            let await_discard_ms = sanitize_latency(
+                if d_discards > 0 {
+                    d_discard_time_ms as f64 / d_discards as f64
+                } else {
+                    0.0
+                },
+            );
+
+            out.push(IntervalDiskMetrics {
+                ts: *ts,
+                rps,
+                wps,
+                io_sec,
+                rd_kbs,
+                wr_kbs,
+                kb_sec,
+                avg_queue_depth,
+                qlen,
+                svctim,
+                await_rd: await_read_ms,
+                await_wr: await_write_ms,
+                discards_s,
+                discards_merged_s,
+                sectors_discarded_s,
+                await_discard_ms,
+                discard_kbs,
+            });
         }
-        if !out.is_empty() {
-            disk_metrics.insert(dev.clone(), out);
-        }
+
+        prev = Some((*ts, stat));
     }
+
+    if !out.is_empty() {
+        disk_metrics.insert(dev.clone(), out);
+    }
+}
         // CPU Metrics
         let mut cpu_metrics: Vec<CpuMetrics> = Vec::new();
         let mut prev: Option<(u64, Vec<u64>, Option<u64>, Option<u64>)> = None;

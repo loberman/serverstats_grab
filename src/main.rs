@@ -66,7 +66,7 @@ mod analyze;
 mod mpath;
 
 // Increment as tool evolves
-const VERSION_NUMBER: &str = "4.0.0";
+const VERSION_NUMBER: &str = "4.0.1";
 
 use std::{
     fs::{File, OpenOptions},
@@ -166,6 +166,14 @@ impl DiskStat {
             sectors_discarded: fields[16].parse().ok()?,
             discard_time_ms: fields[17].parse().ok()?,
         })
+    }
+}
+
+fn sanitize_latency(v: f64) -> f64 {
+    if !v.is_finite() || v > 60000.0 {
+        0.0
+    } else {
+        v
     }
 }
 
@@ -379,111 +387,221 @@ the nice field.
 
 /// Playback disk stats from a previously captured file, printing interval-by-interval deltas.
 /// Now supports filtering output to a given time window (seconds since midnight).
-fn playback_disk(file_path: &str, from_sec: Option<u32>, to_sec: Option<u32>) -> std::io::Result<()> {
+fn playback_disk(
+    file_path: &str,
+    from_sec: Option<u32>,
+    to_sec: Option<u32>,
+    show_discards: bool
+) -> std::io::Result<()> {
+
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
+
     let mut prev: HashMap<String, (u64, DiskStat)> = HashMap::new();
     let mut printed_header = false;
 
     for line in reader.lines().flatten() {
-        if line.starts_with("#TYPE") || line.starts_with('#') { continue; }
+
+        if line.starts_with("#TYPE") || line.starts_with('#') {
+            continue;
+        }
+
         let mut cols = line.split(',');
         let typ = cols.next().unwrap_or("");
-        if typ != "DISK" { continue; }
+
+        if typ != "DISK" {
+            continue;
+        }
+
         let ts = cols.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
         let fields: Vec<&str> = cols.collect();
+
         if let Some(stat) = DiskStat::from_csv_fields(&fields) {
+
             let key = format!("{}-{}-{}", stat.major, stat.minor, stat.name);
+
             if let Some((last_ts, last_stat)) = prev.get(&key) {
+
                 let dt = ts.saturating_sub(*last_ts);
-                if dt == 0 { continue; }
+                if dt == 0 {
+                    continue;
+                }
+
                 let d_reads = stat.reads.saturating_sub(last_stat.reads);
                 let d_reads_merged = stat.reads_merged.saturating_sub(last_stat.reads_merged);
                 let d_writes = stat.writes.saturating_sub(last_stat.writes);
                 let d_writes_merged = stat.writes_merged.saturating_sub(last_stat.writes_merged);
-                let d_sectors_written = stat.sectors_written.saturating_sub(last_stat.sectors_written);
-                let d_sectors_read = stat.sectors_read.saturating_sub(last_stat.sectors_read);
-                let delta_weighted_io_time_ms = stat.weighted_io_time_ms.saturating_sub(last_stat.weighted_io_time_ms);
-                let avg_queue_depth = delta_weighted_io_time_ms as f64 / (dt as f64 * 1000.0);
-                let delta_io_time_ms = stat.io_time_ms.saturating_sub(last_stat.io_time_ms);
-                let d_discards = stat.discards.saturating_sub(last_stat.discards);
-                let d_discards_merged = stat.discards_merged.saturating_sub(last_stat.discards_merged);
-                let d_sectors_discarded = stat.sectors_discarded.saturating_sub(last_stat.sectors_discarded);
-                let d_discard_ms = stat.discard_time_ms.saturating_sub(last_stat.discard_time_ms);
+
+                let d_sectors_written =
+                    stat.sectors_written.saturating_sub(last_stat.sectors_written);
+
+                let d_sectors_read =
+                    stat.sectors_read.saturating_sub(last_stat.sectors_read);
+
+                let delta_weighted_io_time_ms =
+                    stat.weighted_io_time_ms.saturating_sub(last_stat.weighted_io_time_ms);
+
+                let avg_queue_depth =
+                    delta_weighted_io_time_ms as f64 / (dt as f64 * 1000.0);
+
+                let delta_io_time_ms =
+                    stat.io_time_ms.saturating_sub(last_stat.io_time_ms);
+
                 let qlen = if delta_io_time_ms > 0 {
                     delta_weighted_io_time_ms as f64 / delta_io_time_ms as f64
                 } else {
                     0.0
                 };
+
                 let r_s = d_reads as f64 / dt as f64;
                 let w_s = d_writes as f64 / dt as f64;
+
+                // Skip idle disks (no IO activity)
+                if d_reads == 0 && d_writes == 0 {
+                    prev.insert(key, (ts, stat));
+                    continue;
+                }
                 let rd_sec_s = d_sectors_read as f64 / dt as f64;
                 let wr_sec_s = d_sectors_written as f64 / dt as f64;
+
                 let rd_kbs = rd_sec_s * 512.0 / 1024.0;
                 let wr_kbs = wr_sec_s * 512.0 / 1024.0;
-                let await_read_ms = if d_reads > 0 {
-                    (stat.read_time_ms.saturating_sub(last_stat.read_time_ms)) as f64 / d_reads as f64
-                } else { 0.0 };
-                let await_write_ms = if d_writes > 0 {
-                    (stat.write_time_ms.saturating_sub(last_stat.write_time_ms)) as f64 / d_writes as f64
-                } else { 0.0 };
-                // Service time (ms)
+
+                let await_read_ms = sanitize_latency(
+                    if d_reads > 0 {
+                        (stat.read_time_ms.saturating_sub(last_stat.read_time_ms)) as f64 / d_reads as f64
+                    } else { 0.0 }
+                );
+
+                let await_write_ms = sanitize_latency(
+                    if d_writes > 0 {
+                        (stat.write_time_ms.saturating_sub(last_stat.write_time_ms)) as f64 / d_writes as f64
+                    } else { 0.0 }
+                );
+
                 let total_ios = d_reads + d_writes;
+
                 let svctim = if total_ios > 0 {
                     delta_io_time_ms as f64 / total_ios as f64
                 } else {
                     0.0
                 };
-                let _discards_s = d_discards as f64 / dt as f64;
-                let _discards_merged_s = d_discards_merged as f64 / dt as f64;
-                let sectors_discarded_s = d_sectors_discarded as f64 / dt as f64;
+
+                let d_discards = stat.discards.saturating_sub(last_stat.discards);
+                let d_discards_merged =
+                    stat.discards_merged.saturating_sub(last_stat.discards_merged);
+
+                let d_sectors_discarded =
+                    stat.sectors_discarded.saturating_sub(last_stat.sectors_discarded);
+
+                let d_discard_ms =
+                    stat.discard_time_ms.saturating_sub(last_stat.discard_time_ms);
+
+                let sectors_discarded_s =
+                    d_sectors_discarded as f64 / dt as f64;
+
                 let discard_kbs = sectors_discarded_s * 512.0 / 1024.0;
-                let await_discard_ms = if d_discards > 0 {
-                    d_discard_ms as f64 / d_discards as f64
+
+                let await_discard_ms = sanitize_latency(
+                   if d_discards > 0 {
+                       d_discard_ms as f64 / d_discards as f64
+                    } else {
+                        0.0
+                    }
+                );
+
+                let avg_rd_kb = if d_reads > 0 {
+                    (d_sectors_read as f64 * 512.0 / 1024.0) / d_reads as f64
                 } else { 0.0 };
 
-                // --- Time filter logic ---
+                let avg_wr_kb = if d_writes > 0 {
+                    (d_sectors_written as f64 * 512.0 / 1024.0) / d_writes as f64
+                } else { 0.0 };
+
                 let dt_obj = Local.timestamp_opt(ts as i64, 0).single().unwrap();
+
                 let t_hms = dt_obj.format("%H:%M:%S").to_string();
-                let secs_since_midnight = dt_obj.hour() * 3600 + dt_obj.minute() * 60 + dt_obj.second();
+
+                let secs_since_midnight =
+                    dt_obj.hour() * 3600 +
+                    dt_obj.minute() * 60 +
+                    dt_obj.second();
 
                 if let Some(start) = from_sec {
-                    if secs_since_midnight < start { continue; }
-                }
-                if let Some(end) = to_sec {
-                    if secs_since_midnight > end { continue; }
+                    if secs_since_midnight < start {
+                        continue;
+                    }
                 }
 
-                // Print header on first output row
+                if let Some(end) = to_sec {
+                    if secs_since_midnight > end {
+                        continue;
+                    }
+                }
+
                 if !printed_header {
-                    println!(
-                        "{:<10} {:<8} {:<10} {:<5} {:>10} {:>12} {:>10} {:>14} \
-                         {:>12} {:>12} {:>10} {:>10} {:>12} {:>12} {:>10} {:>12} {:>12} \
-                         {:>10} {:>14} {:>14} {:>14} {:>14}",
-                        "Device", "Time", "Epoch", "Δt", "ΔReads", "ΔReadsMerg", "ΔWrites", "ΔWritesMerg",
-                        "AvgQDepth", "Qlen", "r/s", "w/s", "rd_kB/s", "wr_kB/s", "svctim", "await_rd(ms)", "await_wr(ms)",
-                        "Discards", "DiscardsM", "Discardssecs", "DiscardsKBS", "await_dis(ms)"
-                    );
+
+                    if show_discards {
+
+                        println!(
+"{:<10} {:<8} {:<10} {:<5} {:>10} {:>12} {:>10} {:>14} {:>12} {:>12} {:>10} {:>10} {:>12} {:>12} {:>10} {:>12} {:>12} {:>10} {:>14} {:>14} {:>14} {:>14}",
+"Device","Time","Epoch","Δt","ΔReads","ΔReadsMerg","ΔWrites","ΔWritesMerg","AvgQDepth","Qlen","r/s","w/s","rd_kB/s","wr_kB/s","svctim","await_rd(ms)","await_wr(ms)","Discards","DiscardsM","Discardssecs","DiscardsKBS","await_dis(ms)"
+                        );
+
+                    } else {
+
+                        println!(
+"{:<10} {:<8} {:<5} {:>10} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>12} {:>12}",
+"Device","Time","Δt","ΔReads","ΔWrites","Qlen","r/s","w/s","rd_kB/s","wr_kB/s","await_rd(ms)","await_wr(ms)","avg_rd_kB","avg_wr_kB"
+                        );
+                    }
 
                     printed_header = true;
                 }
-                println!(
-                    "{:<10} {:<8} {:<10} {:<5} {:>10} {:>12} {:>10} {:>14} \
-                     {:>12.2} {:>12.2} {:>10.2} {:>10.2} {:>12.2} {:>12.2} {:>10.2} {:>12.2} {:>12.2} \
-                     {:>10} {:>14} {:>14} {:>14.2} {:>14.2}",
-                    stat.name, t_hms, ts, dt,
-                    d_reads, d_reads_merged, d_writes, d_writes_merged,
-                    avg_queue_depth, qlen,
-                    r_s, w_s, rd_kbs, wr_kbs, svctim, await_read_ms, await_write_ms,
-                    d_discards, d_discards_merged, d_sectors_discarded, discard_kbs, await_discard_ms
-                );
+
+                if show_discards {
+
+                    println!(
+"{:<10} {:<8} {:<10} {:<5} {:>10} {:>12} {:>10} {:>14} {:>12.2} {:>12.2} {:>10.2} {:>10.2} {:>12.2} {:>12.2} {:>10.2} {:>12.2} {:>12.2} {:>10} {:>14} {:>14} {:>14.2} {:>14.2}",
+stat.name,t_hms,ts,dt,
+d_reads,d_reads_merged,d_writes,d_writes_merged,
+avg_queue_depth,qlen,
+r_s,w_s,rd_kbs,wr_kbs,svctim,
+await_read_ms,await_write_ms,
+d_discards,d_discards_merged,d_sectors_discarded,
+discard_kbs,await_discard_ms
+                    );
+
+                } else {
+
+                    println!(
+"{:<10} {:<8} {:<5} {:>10} {:>10} {:>12.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>12.2} {:>12.2} {:>12.2} {:>12.2}",
+stat.name,
+t_hms,
+dt,
+d_reads,
+d_writes,
+qlen,
+r_s,
+w_s,
+rd_kbs,
+wr_kbs,
+await_read_ms,
+await_write_ms,
+avg_rd_kb,
+avg_wr_kb
+                    );
+                }
             }
+
             prev.insert(key, (ts, stat));
         }
     }
+
     if !printed_header {
         println!("No disk data found.");
     }
+
     Ok(())
 }
 
@@ -1007,6 +1125,7 @@ fn usage() {
     serverstats_grab -g <interval_seconds> -o <output path>           # Gather mode (all metrics)
     serverstats_grab -pD <capturefile>                                # Playback DISK
     serverstats_grab -pD --from HH:MM:SS --to HH:MM:SS <capturefile>  # Playback DISK time window
+    serverstats_grab -pD --discards <capturefile>                     # Playback DISK full width
     serverstats_grab -pC <capturefile>                                # Playback CPU
     serverstats_grab -pperCpu <capturefile>                           # Per CPU metrics
     serverstats_grab -ptperCpu <capturefile>                          # Per CPU metrics grouped by time (collectl like)
@@ -1092,11 +1211,15 @@ fn main() -> std::io::Result<()> {
             // Argument parsing for optional --from and --to
             let mut from_sec = None;
             let mut to_sec = None;
-            let mut file_arg = None;
+            let mut file_arg: Option<String> = None;
             let mut i = 2; // Start at 2 because 0 is prog, 1 is -pD
-        
+            let mut show_discards = false; 
             while i < args.len() {
                 match args[i].as_str() {
+                    "--discards" => {
+                        show_discards = true;
+                        i += 1;
+                    }
                     "--from" if i+1 < args.len() => {
                         from_sec = parse_time_hms(&args[i+1]);
                         i += 2;
@@ -1113,7 +1236,7 @@ fn main() -> std::io::Result<()> {
                 }
             }
             let file_path = file_arg.as_deref().unwrap_or("serverstats_grab.dat");
-            playback_disk(file_path, from_sec, to_sec)
+            playback_disk(file_path, from_sec, to_sec, show_discards)
         }
 
         "-pC" => {
